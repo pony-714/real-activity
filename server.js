@@ -1,6 +1,7 @@
+require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const mysql = require('mysql2/promise');
+const { Pool } = require('pg');
 const cron = require('node-cron');
 
 const app = express();
@@ -11,56 +12,74 @@ app.use(cors());
 app.use(express.json());
 
 // Database configuration
-const dbConfig = {
-  host: 'sql3.freesqldatabase.com',
-  user: 'sql3799698',
-  password: 'ZC7u7W6BNA',
-  database: 'sql3799698',
-  port: 3306,
-  waitForConnections: true,
-  connectionLimit: 10,
-  queueLimit: 0
-};
+// Support both individual environment variables and DATABASE_URL (Render.com format)
+let dbConfig;
+
+if (process.env.DATABASE_URL || process.env.DB_EXTERNAL_URL) {
+  // Render.com provides DATABASE_URL or DB_EXTERNAL_URL in format: postgresql://user:password@host:port/database
+  const connectionString = process.env.DATABASE_URL || process.env.DB_EXTERNAL_URL;
+  dbConfig = {
+    connectionString: connectionString,
+    ssl: {
+      rejectUnauthorized: false // Required for Render.com PostgreSQL
+    },
+    max: 10,
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: 2000,
+  };
+} else {
+  // Fallback to individual environment variables
+  dbConfig = {
+    host: process.env.DB_HOST || 'localhost',
+    user: process.env.DB_USER || 'postgres',
+    password: process.env.DB_PASSWORD || 'password',
+    database: process.env.DB_NAME || 'real_activity',
+    port: parseInt(process.env.DB_PORT) || 5432,
+    max: 10,
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: 2000,
+  };
+}
 
 // Create connection pool
-const pool = mysql.createPool(dbConfig);
+const pool = new Pool(dbConfig);
 
 // Initialize database
 async function initializeDatabase() {
   try {
-    const connection = await pool.getConnection();
+    const client = await pool.connect();
     
     // Create activities table
-    await connection.execute(`CREATE TABLE IF NOT EXISTS activities (
-      id INT AUTO_INCREMENT PRIMARY KEY,
+    await client.query(`CREATE TABLE IF NOT EXISTS activities (
+      id SERIAL PRIMARY KEY,
       username VARCHAR(255) NOT NULL,
       avatar TEXT,
       game VARCHAR(255) NOT NULL,
       gameType VARCHAR(50) NOT NULL,
       activityType VARCHAR(50) NOT NULL,
-      betAmount INT DEFAULT 0,
-      winAmount INT DEFAULT 0,
+      betAmount INTEGER DEFAULT 0,
+      winAmount INTEGER DEFAULT 0,
       location VARCHAR(10),
-      isLive BOOLEAN DEFAULT 0,
+      isLive BOOLEAN DEFAULT FALSE,
       timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )`);
 
-    // Create indexes for better performance (MySQL syntax)
+    // Create indexes for better performance (PostgreSQL syntax)
     try {
-      await connection.execute(`CREATE INDEX idx_timestamp ON activities(timestamp DESC)`);
+      await client.query(`CREATE INDEX IF NOT EXISTS idx_timestamp ON activities(timestamp DESC)`);
     } catch (indexError) {
       // Index might already exist, ignore error
       console.log('Index idx_timestamp already exists or creation failed');
     }
     
     try {
-      await connection.execute(`CREATE INDEX idx_gameType ON activities(gameType)`);
+      await client.query(`CREATE INDEX IF NOT EXISTS idx_gameType ON activities(gameType)`);
     } catch (indexError) {
       // Index might already exist, ignore error
       console.log('Index idx_gameType already exists or creation failed');
     }
     
-    connection.release();
+    client.release();
     console.log('Database initialized successfully');
   } catch (error) {
     console.error('Error initializing database:', error);
@@ -199,11 +218,11 @@ function generateActivity() {
 // Function to insert activity into database
 async function insertActivity(activity) {
   try {
-    const connection = await pool.getConnection();
-    const [result] = await connection.execute(
+    const client = await pool.connect();
+    const result = await client.query(
       `INSERT INTO activities 
        (username, avatar, game, gameType, activityType, betAmount, winAmount, location, isLive) 
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
       [
         activity.username,
         activity.avatar,
@@ -213,21 +232,21 @@ async function insertActivity(activity) {
         activity.betAmount,
         activity.winAmount,
         activity.location,
-        activity.isLive ? 1 : 0
+        activity.isLive
       ]
     );
     
     // Check if we need to clean up old records
-    const [countResult] = await connection.execute('SELECT COUNT(*) as count FROM activities');
-    const currentCount = countResult[0].count;
+    const countResult = await client.query('SELECT COUNT(*) as count FROM activities');
+    const currentCount = parseInt(countResult.rows[0].count);
     
-    connection.release();
+    client.release();
     
     if (currentCount > 100) {
       await cleanOldActivities();
     }
     
-    return result.insertId;
+    return result.rows[0].id;
   } catch (error) {
     console.error('Error inserting activity:', error);
     throw error;
@@ -237,15 +256,15 @@ async function insertActivity(activity) {
 // Function to get recent activities
 async function getRecentActivities(limit = 20) {
   try {
-    const connection = await pool.getConnection();
-    const [rows] = await connection.execute(
+    const client = await pool.connect();
+    const result = await client.query(
       `SELECT * FROM activities 
        ORDER BY timestamp DESC 
-       LIMIT ?`,
+       LIMIT $1`,
       [limit]
     );
-    connection.release();
-    return rows;
+    client.release();
+    return result.rows;
   } catch (error) {
     console.error('Error fetching activities:', error);
     throw error;
@@ -255,15 +274,15 @@ async function getRecentActivities(limit = 20) {
 // Function to clean old activities (keep only last 100)
 async function cleanOldActivities() {
   try {
-    const connection = await pool.getConnection();
+    const client = await pool.connect();
     
     // First, check the current count
-    const [countResult] = await connection.execute('SELECT COUNT(*) as count FROM activities');
-    const currentCount = countResult[0].count;
+    const countResult = await client.query('SELECT COUNT(*) as count FROM activities');
+    const currentCount = parseInt(countResult.rows[0].count);
     
     if (currentCount > 100) {
       // Delete old records, keeping only the most recent 100
-      await connection.execute(
+      await client.query(
         `DELETE FROM activities 
          WHERE id NOT IN (
            SELECT id FROM (
@@ -276,7 +295,7 @@ async function cleanOldActivities() {
       console.log(`Cleaned old activities. Kept 100 most recent records.`);
     }
     
-    connection.release();
+    client.release();
   } catch (error) {
     console.error('Error cleaning old activities:', error);
     throw error;
