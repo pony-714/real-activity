@@ -23,9 +23,12 @@ if (process.env.DATABASE_URL || process.env.DB_EXTERNAL_URL) {
     ssl: {
       rejectUnauthorized: false // Required for Render.com PostgreSQL
     },
-    max: 10,
-    idleTimeoutMillis: 30000,
-    connectionTimeoutMillis: 2000,
+    max: 5, // Reduced pool size for better stability
+    min: 1, // Keep at least 1 connection alive
+    idleTimeoutMillis: 60000, // Increased to 60 seconds
+    connectionTimeoutMillis: 10000, // Increased to 10 seconds
+    acquireTimeoutMillis: 10000, // Time to wait for connection from pool
+    allowExitOnIdle: false, // Don't exit when idle
   };
 } else {
   // Fallback to individual environment variables
@@ -217,8 +220,9 @@ function generateActivity() {
 
 // Function to insert activity into database
 async function insertActivity(activity) {
+  let client;
   try {
-    const client = await pool.connect();
+    client = await pool.connect();
     const result = await client.query(
       `INSERT INTO activities 
        (username, avatar, game, gameType, activityType, betAmount, winAmount, location, isLive) 
@@ -240,41 +244,63 @@ async function insertActivity(activity) {
     const countResult = await client.query('SELECT COUNT(*) as count FROM activities');
     const currentCount = parseInt(countResult.rows[0].count);
     
-    client.release();
-    
     if (currentCount > 100) {
       await cleanOldActivities();
     }
     
     return result.rows[0].id;
   } catch (error) {
-    console.error('Error inserting activity:', error);
-    throw error;
+    console.error('Error inserting activity:', error.message);
+    // Don't throw error to prevent server crashes
+    return null;
+  } finally {
+    if (client) {
+      client.release();
+    }
   }
 }
 
 // Function to get recent activities
 async function getRecentActivities(limit = 20) {
+  let client;
   try {
-    const client = await pool.connect();
+    client = await pool.connect();
     const result = await client.query(
-      `SELECT * FROM activities 
+      `SELECT 
+        id,
+        username,
+        avatar,
+        game,
+        gameType as "gameType",
+        activityType as "activityType",
+        betAmount as "betAmount",
+        winAmount as "winAmount",
+        location,
+        isLive as "isLive",
+        timestamp
+       FROM activities 
        ORDER BY timestamp DESC 
        LIMIT $1`,
       [limit]
     );
-    client.release();
+    
     return result.rows;
   } catch (error) {
-    console.error('Error fetching activities:', error);
-    throw error;
+    console.error('Error fetching activities:', error.message);
+    // Return empty array instead of throwing error
+    return [];
+  } finally {
+    if (client) {
+      client.release();
+    }
   }
 }
 
 // Function to clean old activities (keep only last 100)
 async function cleanOldActivities() {
+  let client;
   try {
-    const client = await pool.connect();
+    client = await pool.connect();
     
     // First, check the current count
     const countResult = await client.query('SELECT COUNT(*) as count FROM activities');
@@ -294,11 +320,13 @@ async function cleanOldActivities() {
       );
       console.log(`Cleaned old activities. Kept 100 most recent records.`);
     }
-    
-    client.release();
   } catch (error) {
-    console.error('Error cleaning old activities:', error);
-    throw error;
+    console.error('Error cleaning old activities:', error.message);
+    // Don't throw error to prevent server crashes
+  } finally {
+    if (client) {
+      client.release();
+    }
   }
 }
 
@@ -311,7 +339,7 @@ app.get('/api/activities', async (req, res) => {
     const activities = await getRecentActivities(parseInt(limit));
     res.json(activities);
   } catch (error) {
-    console.error('Error fetching activities:', error);
+    console.error('Error in activities API:', error.message);
     res.status(500).json({ error: 'Failed to fetch activities' });
   }
 });
@@ -356,15 +384,18 @@ setInterval(async () => {
   if (timeSinceLastGeneration >= randomInterval) {
     try {
       const activity = generateActivity();
-      await insertActivity(activity);
-      lastGenerationTime = now;
+      const result = await insertActivity(activity);
+      if (result) {
+        lastGenerationTime = now;
+        console.log(`Generated activity: ${activity.username} - ${activity.game}`);
+      }
       
       // Clean old activities more frequently (every 10 activities)
       if (Math.random() < 0.1) { // 10% chance
         await cleanOldActivities();
       }
     } catch (error) {
-      console.error('Error in scheduled activity generation:', error);
+      console.error('Error in scheduled activity generation:', error.message);
     }
   }
 }, 1000); // Check every second
